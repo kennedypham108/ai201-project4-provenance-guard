@@ -609,16 +609,3 @@ The appeal endpoint may use a stricter limit, such as:
 Creators normally should not need to submit many appeals in a short period.
 
 ---
-
-## Milestone 2 Completion Checklist
-
-- [x] The detection signals are defined with specific outputs.
-- [x] The signal-combination formula is defined.
-- [x] A score of `0.60` is explained.
-- [x] Three exact confidence ranges are defined.
-- [x] The exact text for all three transparency labels is written.
-- [x] The appeals workflow is fully defined.
-- [x] A human reviewer's required information is listed.
-- [x] At least two specific edge cases are identified.
-- [x] The `## Architecture` section contains both flows.
-- [x] The `## AI Tool Plan` covers Milestones 3, 4, and 5.
