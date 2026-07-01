@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import re
 import statistics
@@ -11,14 +10,41 @@ from typing import Any
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
 
 load_dotenv()
 
 app = Flask(__name__)
 
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
 AUDIT_LOG_PATH = Path("audit_log.json")
 MODEL_NAME = "llama-3.3-70b-versatile"
+
+AI_LABEL = (
+    "Likely AI-generated: Our automated analysis found strong AI-like patterns "
+    "in this text. This result is not proof of authorship and may be appealed "
+    "by the creator."
+)
+
+HUMAN_LABEL = (
+    "Likely human-written: Our automated analysis found stronger human-like "
+    "patterns in this text. Automated analysis can make mistakes and does not "
+    "verify authorship."
+)
+
+UNCERTAIN_LABEL = (
+    "Uncertain: Our automated analysis could not confidently determine whether "
+    "this text is human-written or AI-generated. No definitive attribution "
+    "should be made from this result."
+)
 
 
 def get_utc_timestamp() -> str:
@@ -39,25 +65,51 @@ def load_audit_log() -> list[dict[str, Any]]:
         return []
 
 
-def save_audit_entry(entry: dict[str, Any]) -> None:
-    """Append one structured entry to the JSON audit log."""
-    entries = load_audit_log()
-    entries.append(entry)
-
+def write_audit_log(entries: list[dict[str, Any]]) -> None:
+    """Write the full structured audit log."""
     with AUDIT_LOG_PATH.open("w", encoding="utf-8") as file:
         json.dump(entries, file, indent=2)
 
 
-def parse_llm_score(raw_content: str) -> tuple[float, str]:
-    """
-    Parse the Groq response.
+def save_audit_entry(entry: dict[str, Any]) -> None:
+    """Append one structured entry to the audit log."""
+    entries = load_audit_log()
+    entries.append(entry)
+    write_audit_log(entries)
 
-    The model is instructed to return JSON with:
-    {
-      "score": 0.0-1.0,
-      "reasoning": "short explanation"
-    }
-    """
+
+def find_original_classification(content_id: str) -> dict[str, Any] | None:
+    """Return the first classification entry matching a content ID."""
+    for entry in load_audit_log():
+        if (
+            entry.get("event_type") == "classification"
+            and entry.get("content_id") == content_id
+        ):
+            return entry
+    return None
+
+
+def update_classification_status(content_id: str, new_status: str) -> bool:
+    """Update the original classification status in the audit log."""
+    entries = load_audit_log()
+    updated = False
+
+    for entry in entries:
+        if (
+            entry.get("event_type") == "classification"
+            and entry.get("content_id") == content_id
+        ):
+            entry["status"] = new_status
+            updated = True
+
+    if updated:
+        write_audit_log(entries)
+
+    return updated
+
+
+def parse_llm_score(raw_content: str) -> tuple[float, str]:
+    """Parse the structured JSON returned by Groq."""
     cleaned = raw_content.strip()
 
     if cleaned.startswith("```"):
@@ -65,7 +117,6 @@ def parse_llm_score(raw_content: str) -> tuple[float, str]:
         cleaned = cleaned.replace("```", "").strip()
 
     parsed = json.loads(cleaned)
-
     score = float(parsed["score"])
     reasoning = str(parsed.get("reasoning", "")).strip()
 
@@ -76,12 +127,7 @@ def parse_llm_score(raw_content: str) -> tuple[float, str]:
 
 
 def analyze_with_llm(text: str) -> dict[str, Any]:
-    """
-    Use Groq as the first attribution signal.
-
-    A score near 1.0 means the text appears more AI-like.
-    A score near 0.0 means the text appears more human-like.
-    """
+    """Use Groq as the semantic and stylistic attribution signal."""
     api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
@@ -116,10 +162,7 @@ The score must be between 0.0 and 1.0:
         temperature=0,
         messages=[
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"Analyze this text:\n\n{text}",
-            },
+            {"role": "user", "content": f"Analyze this text:\n\n{text}"},
         ],
     )
 
@@ -149,11 +192,7 @@ def tokenize_words(text: str) -> list[str]:
 
 
 def analyze_stylometrics(text: str) -> dict[str, Any]:
-    """
-    Compute a structural AI-likelihood score using pure Python.
-
-    Higher scores mean the writing appears more uniform and AI-like.
-    """
+    """Compute the structural AI-likelihood signal."""
     words = tokenize_words(text)
     sentences = split_sentences(text)
 
@@ -184,30 +223,18 @@ def analyze_stylometrics(text: str) -> dict[str, Any]:
         if len(sentence_lengths) > 1
         else 0.0
     )
-
     type_token_ratio = len(set(words)) / len(words)
-
     punctuation_count = sum(1 for char in text if char in string.punctuation)
     punctuation_density = punctuation_count / max(len(text), 1)
-
     average_sentence_length = sum(sentence_lengths) / len(sentence_lengths)
 
-    # Convert raw metrics into AI-like partial scores.
-    # Lower sentence variance is treated as more uniform and therefore more AI-like.
     variance_score = 1.0 - clamp(sentence_length_variance / 120.0)
-
-    # Moderate vocabulary diversity is often more typical of polished generated prose.
-    # Very high diversity, common in short informal writing, lowers the AI-like score.
     ttr_score = clamp((0.85 - type_token_ratio) / 0.45)
-
-    # Very low punctuation density can indicate smooth, uniform prose.
     punctuation_score = 1.0 - clamp(punctuation_density / 0.12)
 
-    # Medium-length sentences contribute more than very short or extremely long ones.
     distance_from_target = abs(average_sentence_length - 18.0)
     average_length_score = 1.0 - clamp(distance_from_target / 18.0)
 
-    # Very short text is unreliable, so move the score toward uncertainty.
     reliability = clamp(len(words) / 80.0, 0.25, 1.0)
 
     raw_score = (
@@ -218,10 +245,9 @@ def analyze_stylometrics(text: str) -> dict[str, Any]:
     )
 
     stylometric_score = 0.5 + (raw_score - 0.5) * reliability
-    stylometric_score = round(clamp(stylometric_score), 2)
 
     return {
-        "stylometric_score": stylometric_score,
+        "stylometric_score": round(clamp(stylometric_score), 2),
         "metrics": {
             "sentence_length_variance": round(sentence_length_variance, 2),
             "type_token_ratio": round(type_token_ratio, 2),
@@ -234,19 +260,13 @@ def analyze_stylometrics(text: str) -> dict[str, Any]:
 
 
 def combine_scores(llm_score: float, stylometric_score: float) -> float:
-    """Combine both signals using the Milestone 2 weighting."""
+    """Combine both signals using the planned 60/40 weighting."""
     combined = (llm_score * 0.60) + (stylometric_score * 0.40)
     return round(clamp(combined), 2)
 
 
 def classify_attribution(combined_score: float) -> str:
-    """
-    Map the combined score to one of three categories.
-
-    0.00-0.34 -> likely_human
-    0.35-0.74 -> uncertain
-    0.75-1.00 -> likely_ai
-    """
+    """Map a combined score to one of the three attribution categories."""
     if combined_score <= 0.34:
         return "likely_human"
     if combined_score <= 0.74:
@@ -254,18 +274,39 @@ def classify_attribution(combined_score: float) -> str:
     return "likely_ai"
 
 
+def generate_label(attribution: str) -> str:
+    """Return the exact transparency-label text from planning.md."""
+    if attribution == "likely_ai":
+        return AI_LABEL
+    if attribution == "likely_human":
+        return HUMAN_LABEL
+    return UNCERTAIN_LABEL
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(error: Exception) -> tuple[Any, int]:
+    """Return a structured rate-limit response."""
+    return (
+        jsonify(
+            {
+                "error": "Rate limit exceeded.",
+                "details": str(error),
+            }
+        ),
+        429,
+    )
+
+
 @app.route("/health", methods=["GET"])
 def health() -> tuple[Any, int]:
-    """Simple endpoint for checking whether the API is running."""
+    """Confirm that the API is running."""
     return jsonify({"status": "ok"}), 200
 
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit() -> tuple[Any, int]:
-    """
-    Accept text and creator_id, run both signals, combine their scores,
-    save an audit entry, and return a structured response.
-    """
+    """Run both signals, score the text, label it, and write the audit log."""
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
@@ -285,6 +326,9 @@ def submit() -> tuple[Any, int]:
 
     text = text.strip()
     creator_id = creator_id.strip()
+
+    if len(text) > 20000:
+        return jsonify({"error": "Text must be 20,000 characters or fewer."}), 400
 
     try:
         llm_result = analyze_with_llm(text)
@@ -315,12 +359,9 @@ def submit() -> tuple[Any, int]:
     content_id = str(uuid.uuid4())
     llm_score = llm_result["llm_score"]
     stylometric_score = stylometric_result["stylometric_score"]
-
     confidence = combine_scores(llm_score, stylometric_score)
     attribution = classify_attribution(confidence)
-
-    # The exact transparency label will be added in Milestone 5.
-    label = "Final transparency label will be added in Milestone 5."
+    label = generate_label(attribution)
     status = "classified"
 
     audit_entry = {
@@ -328,12 +369,15 @@ def submit() -> tuple[Any, int]:
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": get_utc_timestamp(),
+        "text": text,
         "attribution": attribution,
         "confidence": confidence,
+        "label": label,
         "llm_score": llm_score,
         "stylometric_score": stylometric_score,
         "stylometric_metrics": stylometric_result["metrics"],
         "llm_reasoning": llm_result["reasoning"],
+        "appeal_filed": False,
         "status": status,
     }
 
@@ -350,26 +394,116 @@ def submit() -> tuple[Any, int]:
             500,
         )
 
-    response_body = {
+    return (
+        jsonify(
+            {
+                "content_id": content_id,
+                "attribution": attribution,
+                "confidence": confidence,
+                "label": label,
+                "status": status,
+                "signals": {
+                    "llm_score": llm_score,
+                    "llm_reasoning": llm_result["reasoning"],
+                    "stylometric_score": stylometric_score,
+                    "stylometric_metrics": stylometric_result["metrics"],
+                },
+            }
+        ),
+        200,
+    )
+
+
+@app.route("/appeal", methods=["POST"])
+@limiter.limit("5 per hour")
+def appeal() -> tuple[Any, int]:
+    """Accept a creator appeal and mark the original content under review."""
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be valid JSON."}), 400
+
+    content_id = data.get("content_id")
+    creator_id = data.get("creator_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not isinstance(content_id, str) or not content_id.strip():
+        return jsonify({"error": "content_id is required."}), 400
+
+    if not isinstance(creator_id, str) or not creator_id.strip():
+        return jsonify({"error": "creator_id is required."}), 400
+
+    if not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+        return jsonify({"error": "creator_reasoning is required."}), 400
+
+    content_id = content_id.strip()
+    creator_id = creator_id.strip()
+    creator_reasoning = creator_reasoning.strip()
+
+    original = find_original_classification(content_id)
+
+    if original is None:
+        return jsonify({"error": "No classification was found for that content_id."}), 404
+
+    if original.get("creator_id") != creator_id:
+        return jsonify({"error": "creator_id does not match the original submission."}), 403
+
+    if original.get("status") == "under_review":
+        return jsonify({"error": "This content is already under review."}), 409
+
+    if not update_classification_status(content_id, "under_review"):
+        return jsonify({"error": "The original status could not be updated."}), 500
+
+    entries = load_audit_log()
+    for entry in entries:
+        if (
+            entry.get("event_type") == "classification"
+            and entry.get("content_id") == content_id
+        ):
+            entry["appeal_filed"] = True
+    write_audit_log(entries)
+
+    appeal_entry = {
+        "event_type": "appeal",
         "content_id": content_id,
-        "attribution": attribution,
-        "confidence": confidence,
-        "label": label,
-        "status": status,
-        "signals": {
-            "llm_score": llm_score,
-            "llm_reasoning": llm_result["reasoning"],
-            "stylometric_score": stylometric_score,
-            "stylometric_metrics": stylometric_result["metrics"],
-        },
+        "creator_id": creator_id,
+        "timestamp": get_utc_timestamp(),
+        "original_attribution": original.get("attribution"),
+        "original_confidence": original.get("confidence"),
+        "llm_score": original.get("llm_score"),
+        "stylometric_score": original.get("stylometric_score"),
+        "creator_reasoning": creator_reasoning,
+        "status": "under_review",
     }
 
-    return jsonify(response_body), 200
+    try:
+        save_audit_entry(appeal_entry)
+    except OSError as error:
+        return (
+            jsonify(
+                {
+                    "error": "The status was updated but the appeal could not be logged.",
+                    "details": str(error),
+                }
+            ),
+            500,
+        )
+
+    return (
+        jsonify(
+            {
+                "content_id": content_id,
+                "message": "Your appeal has been received.",
+                "status": "under_review",
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/log", methods=["GET"])
 def get_log() -> tuple[Any, int]:
-    """Return the most recent audit-log entries."""
+    """Return the most recent structured audit entries."""
     entries = load_audit_log()
     return jsonify({"entries": entries[-50:]}), 200
 
