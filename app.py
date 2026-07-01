@@ -1,5 +1,9 @@
 import json
+import math
 import os
+import re
+import statistics
+import string
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,6 +132,128 @@ The score must be between 0.0 and 1.0:
     }
 
 
+def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    """Keep a numeric value inside the requested range."""
+    return max(minimum, min(maximum, value))
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into non-empty sentence-like units."""
+    parts = re.split(r"[.!?]+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def tokenize_words(text: str) -> list[str]:
+    """Return lowercase word tokens."""
+    return re.findall(r"\b[\w'-]+\b", text.lower())
+
+
+def analyze_stylometrics(text: str) -> dict[str, Any]:
+    """
+    Compute a structural AI-likelihood score using pure Python.
+
+    Higher scores mean the writing appears more uniform and AI-like.
+    """
+    words = tokenize_words(text)
+    sentences = split_sentences(text)
+
+    if not words:
+        return {
+            "stylometric_score": 0.5,
+            "metrics": {
+                "sentence_length_variance": 0.0,
+                "type_token_ratio": 0.0,
+                "punctuation_density": 0.0,
+                "average_sentence_length": 0.0,
+                "word_count": 0,
+                "sentence_count": 0,
+            },
+        }
+
+    sentence_lengths = [
+        len(tokenize_words(sentence))
+        for sentence in sentences
+        if tokenize_words(sentence)
+    ]
+
+    if not sentence_lengths:
+        sentence_lengths = [len(words)]
+
+    sentence_length_variance = (
+        statistics.pvariance(sentence_lengths)
+        if len(sentence_lengths) > 1
+        else 0.0
+    )
+
+    type_token_ratio = len(set(words)) / len(words)
+
+    punctuation_count = sum(1 for char in text if char in string.punctuation)
+    punctuation_density = punctuation_count / max(len(text), 1)
+
+    average_sentence_length = sum(sentence_lengths) / len(sentence_lengths)
+
+    # Convert raw metrics into AI-like partial scores.
+    # Lower sentence variance is treated as more uniform and therefore more AI-like.
+    variance_score = 1.0 - clamp(sentence_length_variance / 120.0)
+
+    # Moderate vocabulary diversity is often more typical of polished generated prose.
+    # Very high diversity, common in short informal writing, lowers the AI-like score.
+    ttr_score = clamp((0.85 - type_token_ratio) / 0.45)
+
+    # Very low punctuation density can indicate smooth, uniform prose.
+    punctuation_score = 1.0 - clamp(punctuation_density / 0.12)
+
+    # Medium-length sentences contribute more than very short or extremely long ones.
+    distance_from_target = abs(average_sentence_length - 18.0)
+    average_length_score = 1.0 - clamp(distance_from_target / 18.0)
+
+    # Very short text is unreliable, so move the score toward uncertainty.
+    reliability = clamp(len(words) / 80.0, 0.25, 1.0)
+
+    raw_score = (
+        variance_score * 0.35
+        + ttr_score * 0.30
+        + punctuation_score * 0.20
+        + average_length_score * 0.15
+    )
+
+    stylometric_score = 0.5 + (raw_score - 0.5) * reliability
+    stylometric_score = round(clamp(stylometric_score), 2)
+
+    return {
+        "stylometric_score": stylometric_score,
+        "metrics": {
+            "sentence_length_variance": round(sentence_length_variance, 2),
+            "type_token_ratio": round(type_token_ratio, 2),
+            "punctuation_density": round(punctuation_density, 4),
+            "average_sentence_length": round(average_sentence_length, 2),
+            "word_count": len(words),
+            "sentence_count": len(sentence_lengths),
+        },
+    }
+
+
+def combine_scores(llm_score: float, stylometric_score: float) -> float:
+    """Combine both signals using the Milestone 2 weighting."""
+    combined = (llm_score * 0.60) + (stylometric_score * 0.40)
+    return round(clamp(combined), 2)
+
+
+def classify_attribution(combined_score: float) -> str:
+    """
+    Map the combined score to one of three categories.
+
+    0.00-0.34 -> likely_human
+    0.35-0.74 -> uncertain
+    0.75-1.00 -> likely_ai
+    """
+    if combined_score <= 0.34:
+        return "likely_human"
+    if combined_score <= 0.74:
+        return "uncertain"
+    return "likely_ai"
+
+
 @app.route("/health", methods=["GET"])
 def health() -> tuple[Any, int]:
     """Simple endpoint for checking whether the API is running."""
@@ -137,10 +263,8 @@ def health() -> tuple[Any, int]:
 @app.route("/submit", methods=["POST"])
 def submit() -> tuple[Any, int]:
     """
-    Accept text and creator_id, run the first signal, save an audit entry,
-    and return a structured response.
-
-    Confidence and label are placeholders until Milestones 4 and 5.
+    Accept text and creator_id, run both signals, combine their scores,
+    save an audit entry, and return a structured response.
     """
     data = request.get_json(silent=True)
 
@@ -163,7 +287,8 @@ def submit() -> tuple[Any, int]:
     creator_id = creator_id.strip()
 
     try:
-        signal_result = analyze_with_llm(text)
+        llm_result = analyze_with_llm(text)
+        stylometric_result = analyze_stylometrics(text)
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 500
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
@@ -188,12 +313,14 @@ def submit() -> tuple[Any, int]:
         )
 
     content_id = str(uuid.uuid4())
-    llm_score = signal_result["llm_score"]
+    llm_score = llm_result["llm_score"]
+    stylometric_score = stylometric_result["stylometric_score"]
 
-    # Milestone 3 placeholders.
-    attribution = "signal_1_complete"
-    confidence = llm_score
-    label = "First detection signal complete. Final label will be added in Milestone 5."
+    confidence = combine_scores(llm_score, stylometric_score)
+    attribution = classify_attribution(confidence)
+
+    # The exact transparency label will be added in Milestone 5.
+    label = "Final transparency label will be added in Milestone 5."
     status = "classified"
 
     audit_entry = {
@@ -204,7 +331,9 @@ def submit() -> tuple[Any, int]:
         "attribution": attribution,
         "confidence": confidence,
         "llm_score": llm_score,
-        "llm_reasoning": signal_result["reasoning"],
+        "stylometric_score": stylometric_score,
+        "stylometric_metrics": stylometric_result["metrics"],
+        "llm_reasoning": llm_result["reasoning"],
         "status": status,
     }
 
@@ -229,7 +358,9 @@ def submit() -> tuple[Any, int]:
         "status": status,
         "signals": {
             "llm_score": llm_score,
-            "llm_reasoning": signal_result["reasoning"],
+            "llm_reasoning": llm_result["reasoning"],
+            "stylometric_score": stylometric_score,
+            "stylometric_metrics": stylometric_result["metrics"],
         },
     }
 
